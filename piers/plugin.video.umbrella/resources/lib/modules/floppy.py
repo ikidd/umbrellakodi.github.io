@@ -12,7 +12,7 @@ import time
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin
 from json import dumps as jsdumps
 from resources.lib.database import floppysync
 from resources.lib.modules import control
@@ -148,6 +148,144 @@ def get_all_pages(url, silent=False):
 	except Exception:
 		log_utils.error()
 		return None
+
+
+class FeedCursorExpired(Exception): pass
+class FeedUnavailable(Exception): pass
+
+
+def _feed_page(path, cursor, limit):
+	response = getFloppy(path + '?' + urlencode({'cursor': int(cursor), 'limit': int(limit)}), silent=True)
+	if response is None: raise ValueError('Floppy change feed request failed')
+	try: payload = response.json()
+	except Exception: payload = {}
+	if response.status_code != 200: return response.status_code, payload
+	if not isinstance(payload, dict) or not isinstance(payload.get('results'), list): raise ValueError('Invalid Floppy change feed')
+	try: next_cursor = int(payload.get('next_cursor'))
+	except (TypeError, ValueError): raise ValueError('Invalid Floppy change cursor')
+	if next_cursor < int(cursor): raise ValueError('Floppy change cursor moved backwards')
+	payload['next_cursor'] = next_cursor
+	payload['has_more'] = bool(payload.get('has_more'))
+	return response.status_code, payload
+
+
+def _tmdb_identity(change):
+	ids = change.get('ids') or {}
+	value = ids.get('tmdb') or change.get('media_id')
+	if value in (None, ''): raise ValueError('Missing TMDB identity')
+	value = str(value)
+	if not value.isdigit() or int(value) <= 0: raise ValueError('Invalid TMDB identity')
+	return value
+
+
+def _normalize_watched_change(change):
+	if not isinstance(change, dict): raise ValueError('Invalid watched change')
+	media_type = change.get('media_type')
+	if media_type not in ('movie', 'episode'): return None
+	if change.get('source') not in (None, '', 'tmdb'): return None
+	tmdb = _tmdb_identity(change)
+	if media_type == 'movie':
+		if not change.get('watched'): return ('delete_movie', tmdb)
+		ids = change.get('ids') or {}
+		imdb = str(ids.get('imdb') or '') or _resolve_movie_imdb(tmdb)
+		return ('upsert_movie', (imdb, tmdb, str(change.get('title') or ''), str(change.get('year') or ''), str(change.get('watched_at') or '')))
+	season, episode = change.get('season_number'), change.get('episode_number')
+	if season is None or episode is None: raise ValueError('Missing episode identity')
+	season, episode = int(season), int(episode)
+	if season < 0 or episode < 1: raise ValueError('Invalid episode identity')
+	if _uses_custom_episode_numbering(tmdb): return None
+	if not change.get('watched'): return ('delete_episode', (tmdb, season, episode))
+	ids = change.get('ids') or {}
+	imdb = str(ids.get('imdb') or '') or _resolve_tv_imdb(tmdb)
+	return ('upsert_episode', (imdb, tmdb, str(ids.get('tvdb') or ''), season, episode, str(change.get('watched_at') or '')))
+
+
+def _normalize_progress_change(change):
+	if not isinstance(change, dict): raise ValueError('Invalid progress change')
+	media_type = change.get('media_type')
+	if media_type not in ('movie', 'episode'): return None
+	if change.get('source') not in (None, '', 'tmdb'): return None
+	tmdb = _tmdb_identity(change)
+	season = episode = ''
+	if media_type == 'episode':
+		if change.get('season_number') is None or change.get('episode_number') is None: raise ValueError('Missing episode identity')
+		season, episode = str(int(change['season_number'])), str(int(change['episode_number']))
+		if _uses_custom_episode_numbering(tmdb): return None
+	key = (tmdb, season, episode)
+	duration, position = float(change.get('duration_seconds') or 0), float(change.get('position_seconds') or 0)
+	if change.get('completed') or duration <= 0 or position <= 0: return ('delete', key)
+	ids = change.get('ids') or {}
+	from hashlib import md5
+	imdb, tvdb = str(ids.get('imdb') or ''), str(ids.get('tvdb') or '')
+	resume_id = md5(repr((imdb, tmdb, tvdb, season, episode)).encode('utf-8')).hexdigest()
+	percent = str(round(min(position / duration, 1) * 100, 2))
+	return ('upsert', (str(change.get('series_title') or ''), str(change.get('title') or ''), resume_id, imdb, tmdb, tvdb,
+		season, episode, '', '', '', str(int(round(duration))), percent, datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')))
+
+
+def _uses_custom_episode_numbering(tmdb):
+	from resources.lib.modules import episode_mapping
+	return bool(episode_mapping.supported(tmdb))
+
+
+def _drain_feed(path, cursor, limit, normalize, apply):
+	total = 0
+	for _page_number in range(1000):
+		if control.monitor.abortRequested(): raise ValueError('Floppy change feed cancelled')
+		status, page = _feed_page(path, cursor, limit)
+		if status == 409 and page.get('code') == 'cursor_expired': raise FeedCursorExpired()
+		if status in (404, 405): raise FeedUnavailable()
+		if status != 200: raise ValueError('Floppy change feed returned HTTP %s' % status)
+		next_cursor = page['next_cursor']
+		if page['has_more'] and next_cursor == cursor: raise ValueError('Floppy change feed did not advance')
+		last_sequence = cursor
+		for change in page['results']:
+			try: sequence = int(change.get('sequence'))
+			except (AttributeError, TypeError, ValueError): raise ValueError('Invalid Floppy change sequence')
+			if sequence <= last_sequence or sequence > next_cursor: raise ValueError('Out-of-order Floppy change sequence')
+			last_sequence = sequence
+		if page['results'] and last_sequence != next_cursor: raise ValueError('Floppy page cursor does not match its last change')
+		operations = []
+		for change in page['results']:
+			operation = normalize(change)
+			if operation is not None: operations.append(operation)
+		total += apply(operations, cursor, next_cursor)
+		cursor = next_cursor
+		if not page['has_more']: return total
+	raise ValueError('Floppy change feed exceeded page limit')
+
+
+def _drain_watched(cursor):
+	return _drain_feed('/sync/changes/', int(cursor), 200, _normalize_watched_change, floppysync.apply_watched_changes)
+
+
+def _drain_progress(cursor):
+	return _drain_feed('/sync/progress-changes/', int(cursor), 500, _normalize_progress_change, floppysync.apply_progress_changes)
+
+
+def _capture_feed_cursor(path):
+	status, page = _feed_page(path, 0, 1)
+	if status in (404, 405): raise FeedUnavailable()
+	if status != 200: raise ValueError('Floppy change feed returned HTTP %s' % status)
+	value = page.get('newest_sequence')
+	if value is None: return 0
+	value = int(value)
+	if value < 0: raise ValueError('Invalid newest sequence')
+	return value
+
+
+def _credential_identity():
+	from hashlib import sha256
+	value = floppyBaseUrl().rstrip('/') + '\0' + getSetting('floppy.token')
+	return sha256(value.encode('utf-8')).hexdigest()
+
+
+def _prepare_sync_identity():
+	identity = _credential_identity()
+	if floppysync.get_sync_state('sync_identity') != identity:
+		floppysync.reset_sync_cursor('watched')
+		floppysync.reset_sync_cursor('progress')
+		floppysync.set_sync_state('sync_identity', identity)
 
 
 #### Auth: static bearer token pasted from the Floppy web UI ####
@@ -755,38 +893,62 @@ def _sync_watched_episodes_from_shows(progress_callback=None):
 	return list(rows.values())
 
 
+def _sync_watched_snapshot(cursor=None, expected_cursor=None, progress_callback=None):
+	credentials = (floppyBaseUrl(), getSetting('floppy.token'))
+	revision = floppysync.get_revision('history')
+	items = _fetch_status_bucket('movie', STATUS_COMPLETED)
+	if items is None:
+		log_utils.log('FLOPPY: movie fetch incomplete; keeping previous watched history', level=log_utils.LOGWARNING)
+		return False
+	movies = []
+	for idx, entry in enumerate(items):
+		if control.monitor.abortRequested(): return False
+		item = entry.get('item') or {}
+		tmdb = str(item.get('media_id') or '')
+		if item.get('source') not in (None, '', 'tmdb'): continue
+		if not tmdb: return False
+		imdb = str((item.get('ids') or {}).get('imdb') or '') or _resolve_movie_imdb(tmdb)
+		last = entry.get('end_date') or entry.get('progressed_at') or entry.get('created_at') or ''
+		movies.append((imdb, tmdb, item.get('title', ''), (item.get('release_datetime') or '')[:4], last))
+		if progress_callback: progress_callback('Syncing watched movies', idx + 1, len(items))
+	episodes = _sync_watched_episodes_from_shows(progress_callback=progress_callback)
+	if episodes is None or control.monitor.abortRequested():
+		log_utils.log('FLOPPY: episode fetch incomplete or cancelled; keeping previous watched history', level=log_utils.LOGWARNING)
+		return False
+	if credentials != (floppyBaseUrl(), getSetting('floppy.token')): return False
+	if not floppysync.store_watched_history(movies, episodes, expected_revision=revision, cursor=cursor, expected_cursor=expected_cursor): return False
+	floppysync.clear_cache()
+	log_utils.log('FLOPPY: watched sync complete (%s movies, %s episodes)' % (len(movies), len(episodes)), level=log_utils.LOGINFO)
+	control.trigger_widget_refresh()
+	return True
+
+
 def sync_watchedProgress(activities=None, forced=False, progress_callback=None):
 	lock = None
 	try:
 		if not getFloppyCredentialsInfo(): return False
 		lock = floppysync.acquire_sync_lock()
 		if lock is None: return False
-		credentials = (floppyBaseUrl(), getSetting('floppy.token'))
-		revision = floppysync.get_revision('history')
-		items = _fetch_status_bucket('movie', STATUS_COMPLETED)
-		if items is None:
-			log_utils.log('FLOPPY: movie fetch incomplete; keeping previous watched history', level=log_utils.LOGWARNING)
-			return False
-		movies = []
-		for idx, entry in enumerate(items):
-			if control.monitor.abortRequested(): return False
-			item = entry.get('item') or {}
-			tmdb = str(item.get('media_id') or '')
-			if item.get('source') not in (None, '', 'tmdb'): continue
-			if not tmdb: return False
-			imdb = str((item.get('ids') or {}).get('imdb') or '') or _resolve_movie_imdb(tmdb)
-			last = entry.get('end_date') or entry.get('progressed_at') or entry.get('created_at') or ''
-			movies.append((imdb, tmdb, item.get('title', ''), (item.get('release_datetime') or '')[:4], last))
-			if progress_callback: progress_callback('Syncing watched movies', idx + 1, len(items))
-		episodes = _sync_watched_episodes_from_shows(progress_callback=progress_callback)
-		if episodes is None or control.monitor.abortRequested():
-			log_utils.log('FLOPPY: episode fetch incomplete or cancelled; keeping previous watched history', level=log_utils.LOGWARNING)
-			return False
-		if credentials != (floppyBaseUrl(), getSetting('floppy.token')): return False
-		if not floppysync.store_watched_history(movies, episodes, expected_revision=revision): return False
-		floppysync.clear_cache()
-		log_utils.log('FLOPPY: watched sync complete (%s movies, %s episodes)' % (len(movies), len(episodes)), level=log_utils.LOGINFO)
-		control.trigger_widget_refresh()
+		_prepare_sync_identity()
+		stored = floppysync.get_sync_state('watched_cursor')
+		if stored is not None and not forced:
+			try:
+				_drain_watched(int(stored))
+				return True
+			except FeedCursorExpired:
+				floppysync.reset_sync_cursor('watched')
+				stored = None
+			except FeedUnavailable:
+				success = _sync_watched_snapshot(progress_callback=progress_callback)
+				if success: floppysync.reset_sync_cursor('watched')
+				return success
+		try: captured = _capture_feed_cursor('/sync/changes/')
+		except FeedUnavailable:
+			success = _sync_watched_snapshot(progress_callback=progress_callback)
+			if success: floppysync.reset_sync_cursor('watched')
+			return success
+		if not _sync_watched_snapshot(captured, stored, progress_callback=progress_callback): return False
+		_drain_watched(captured)
 		return True
 	except:
 		log_utils.error()
@@ -855,37 +1017,61 @@ def get_collection_entries(media_type='movie'):
 	except: log_utils.error()
 	return results
 
+def _sync_progress_snapshot(cursor=None, expected_cursor=None):
+	credentials = (floppyBaseUrl(), getSetting('floppy.token'))
+	revision = floppysync.get_revision('bookmarks')
+	items = get_all_pages('/playback/progress/', silent=True)
+	if items is None: return False
+	rows = []
+	for item in items:
+		if control.monitor.abortRequested(): return False
+		if item.get('completed') or item.get('media_type') not in ('movie', 'episode'): continue
+		if item.get('source') not in (None, '', 'tmdb'): continue
+		ids = item.get('ids') or {}
+		tmdb, imdb, tvdb = str(ids.get('tmdb') or item.get('media_id') or ''), str(ids.get('imdb') or ''), str(ids.get('tvdb') or '')
+		if not tmdb: return False
+		duration, position = float(item.get('duration_seconds') or 0), float(item.get('position_seconds') or 0)
+		if duration <= 0 or position <= 0: continue
+		season, episode = '', ''
+		if item.get('media_type') == 'episode':
+			if item.get('season_number') is None or item.get('episode_number') is None: return False
+			season, episode = str(int(item['season_number'])), str(int(item['episode_number']))
+		percent = str(round(min(position / duration, 1) * 100, 2))
+		from hashlib import md5
+		resume_id = md5(repr((imdb, tmdb, tvdb, season, episode)).encode('utf-8')).hexdigest()
+		rows.append((item.get('series_title') or '', item.get('title') or '', resume_id, imdb, tmdb, tvdb,
+			season, episode, '', '', '', str(int(round(duration))), percent, item.get('updated_at') or ''))
+	if credentials != (floppyBaseUrl(), getSetting('floppy.token')): return False
+	return floppysync.store_bookmarks(rows, expected_revision=revision, cursor=cursor, expected_cursor=expected_cursor)
+
+
 def sync_playbackProgress(activities=None, forced=False):
 	lock = None
 	try:
 		if not getFloppyCredentialsInfo(): return False
 		lock = floppysync.acquire_sync_lock()
 		if lock is None: return False
-		credentials = (floppyBaseUrl(), getSetting('floppy.token'))
-		revision = floppysync.get_revision('bookmarks')
-		items = get_all_pages('/playback/progress/', silent=True)
-		if items is None: return False
-		rows = []
-		for item in items:
-			if control.monitor.abortRequested(): return False
-			if item.get('completed') or item.get('media_type') not in ('movie', 'episode'): continue
-			if item.get('source') not in (None, '', 'tmdb'): continue
-			ids = item.get('ids') or {}
-			tmdb, imdb, tvdb = str(ids.get('tmdb') or item.get('media_id') or ''), str(ids.get('imdb') or ''), str(ids.get('tvdb') or '')
-			if not tmdb: return False
-			duration, position = float(item.get('duration_seconds') or 0), float(item.get('position_seconds') or 0)
-			if duration <= 0 or position <= 0: continue
-			season, episode = '', ''
-			if item.get('media_type') == 'episode':
-				if item.get('season_number') is None or item.get('episode_number') is None: return False
-				season, episode = str(int(item['season_number'])), str(int(item['episode_number']))
-			percent = str(round(min(position / duration, 1) * 100, 2))
-			from hashlib import md5
-			resume_id = md5(repr((imdb, tmdb, tvdb, season, episode)).encode('utf-8')).hexdigest()
-			rows.append((item.get('series_title') or '', item.get('title') or '', resume_id, imdb, tmdb, tvdb,
-				season, episode, '', '', '', str(duration), percent, item.get('updated_at') or ''))
-		if credentials != (floppyBaseUrl(), getSetting('floppy.token')): return False
-		return floppysync.store_bookmarks(rows, expected_revision=revision)
+		_prepare_sync_identity()
+		stored = floppysync.get_sync_state('progress_cursor')
+		if stored is not None and not forced:
+			try:
+				_drain_progress(int(stored))
+				return True
+			except FeedCursorExpired:
+				floppysync.reset_sync_cursor('progress')
+				stored = None
+			except FeedUnavailable:
+				success = _sync_progress_snapshot()
+				if success: floppysync.reset_sync_cursor('progress')
+				return success
+		try: captured = _capture_feed_cursor('/sync/progress-changes/')
+		except FeedUnavailable:
+			success = _sync_progress_snapshot()
+			if success: floppysync.reset_sync_cursor('progress')
+			return success
+		if not _sync_progress_snapshot(captured, stored): return False
+		_drain_progress(captured)
+		return True
 	except:
 		log_utils.error()
 		return False

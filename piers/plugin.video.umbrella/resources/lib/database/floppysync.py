@@ -115,6 +115,8 @@ def delete_floppy_tables(tables):
 			except:
 				from resources.lib.modules import log_utils
 				log_utils.error()
+		dbcur.execute('CREATE TABLE IF NOT EXISTS floppy_sync_state (key TEXT PRIMARY KEY, value TEXT)')
+		dbcur.execute('DELETE FROM floppy_sync_state')
 		dbcur.execute('''CREATE TABLE IF NOT EXISTS service (setting TEXT, value TEXT, UNIQUE(setting));''')
 		epoch = '1970-01-01T00:00:00.000Z'
 		for key in ('last_history_at', 'last_watched_movies_at', 'last_watched_episodes_at'):
@@ -551,25 +553,78 @@ def clear_bookmarks():
 		except: pass
 
 
-def store_watched_history(movies, episodes, replace=True, expected_revision=None):
+def _ensure_sync_state(cursor):
+	cursor.execute('CREATE TABLE IF NOT EXISTS floppy_sync_state (key TEXT PRIMARY KEY, value TEXT)')
+
+
+def _read_sync_state(cursor, key):
+	_ensure_sync_state(cursor)
+	row = cursor.execute('SELECT value FROM floppy_sync_state WHERE key=?', (key,)).fetchone()
+	return row[0] if row else None
+
+
+def _write_sync_state(cursor, key, value):
+	_ensure_sync_state(cursor)
+	cursor.execute('INSERT OR REPLACE INTO floppy_sync_state (key, value) VALUES (?, ?)', (key, str(value)))
+
+
+def get_sync_state(key, default=None):
+	connection = get_connection()
+	try:
+		value = _read_sync_state(connection.cursor(), key)
+		return default if value is None else value
+	finally:
+		connection.close()
+
+
+def set_sync_state(key, value):
+	connection = get_connection()
+	try:
+		cursor = connection.cursor()
+		_write_sync_state(cursor, key, value)
+		connection.commit()
+	finally:
+		connection.close()
+
+
+def reset_sync_cursor(resource):
+	connection = get_connection()
+	try:
+		cursor = connection.cursor()
+		_ensure_sync_state(cursor)
+		cursor.execute('DELETE FROM floppy_sync_state WHERE key=?', (resource + '_cursor',))
+		connection.commit()
+	finally:
+		connection.close()
+
+
+def _check_cursor(cursor, key, expected):
+	stored = _read_sync_state(cursor, key)
+	wanted = None if expected is None else str(expected)
+	if stored != wanted: raise ValueError('%s: expected %r, stored %r' % (key, wanted, stored))
+
+
+def store_watched_history(movies, episodes, replace=True, expected_revision=None, cursor=None, expected_cursor=None):
 	"""Commit a complete history fetch together; roll back failed replacements."""
 	connection = None
 	try:
 		connection = get_connection()
 		connection.execute('PRAGMA journal_mode = DELETE')
 		connection.execute('PRAGMA synchronous = NORMAL')
-		cursor = connection.cursor()
-		_ensure_watched_tables(cursor)
+		dbcur = connection.cursor()
+		_ensure_watched_tables(dbcur)
 		connection.execute('BEGIN IMMEDIATE')
-		if expected_revision is not None and _read_revision(cursor, 'history') != expected_revision:
+		if expected_revision is not None and _read_revision(dbcur, 'history') != expected_revision:
 			connection.rollback()
 			return False
-		_reconcile_rows(cursor, 'floppy_watched_movies', movies, (1,), replace)
-		_reconcile_rows(cursor, 'floppy_watched_episodes', episodes, (1, 3, 4), replace)
-		_bump_revision(cursor, 'history')
-		cursor.execute('CREATE TABLE IF NOT EXISTS service (setting TEXT, value TEXT, UNIQUE(setting))')
-		cursor.execute('INSERT OR REPLACE INTO service VALUES (?, ?)',
+		if cursor is not None and expected_cursor is not None: _check_cursor(dbcur, 'watched_cursor', expected_cursor)
+		_reconcile_rows(dbcur, 'floppy_watched_movies', movies, (1,), replace)
+		_reconcile_rows(dbcur, 'floppy_watched_episodes', episodes, (1, 3, 4), replace)
+		_bump_revision(dbcur, 'history')
+		dbcur.execute('CREATE TABLE IF NOT EXISTS service (setting TEXT, value TEXT, UNIQUE(setting))')
+		dbcur.execute('INSERT OR REPLACE INTO service VALUES (?, ?)',
 			('last_history_at', datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')))
+		if cursor is not None: _write_sync_state(dbcur, 'watched_cursor', int(cursor))
 		connection.commit()
 		return True
 	except:
@@ -579,6 +634,67 @@ def store_watched_history(movies, episodes, replace=True, expected_revision=None
 		return False
 	finally:
 		if connection is not None: connection.close()
+
+
+def _watched_movie_row(cursor, row):
+	imdb, tmdb, title, year, watched_at = (str(value or '') for value in row)
+	if not tmdb: raise ValueError('Missing movie TMDB id')
+	existing = cursor.execute('SELECT imdb, title, year FROM floppy_watched_movies WHERE tmdb=?', (tmdb,)).fetchone()
+	if existing:
+		imdb, title, year = imdb or existing[0], title or existing[1], year or existing[2]
+	return (imdb, tmdb, title, year, watched_at)
+
+
+def _watched_episode_row(cursor, row):
+	imdb, tmdb, tvdb, season, episode, watched_at = row
+	tmdb, imdb, tvdb = str(tmdb or ''), str(imdb or ''), str(tvdb or '')
+	season, episode = int(season), int(episode)
+	if not tmdb or season < 0 or episode < 0: raise ValueError('Invalid episode identity')
+	existing = cursor.execute('SELECT show_imdb, show_tvdb FROM floppy_watched_episodes WHERE show_tmdb=? LIMIT 1', (tmdb,)).fetchone()
+	if existing: imdb, tvdb = imdb or existing[0], tvdb or existing[1]
+	return (imdb, tmdb, tvdb, season, episode, str(watched_at or ''))
+
+
+def apply_watched_changes(operations, old_cursor, new_cursor):
+	old_cursor, new_cursor = int(old_cursor), int(new_cursor)
+	if new_cursor < old_cursor: raise ValueError('Cursor cannot move backwards')
+	connection = get_connection()
+	try:
+		connection.execute('PRAGMA journal_mode = DELETE')
+		connection.execute('PRAGMA synchronous = NORMAL')
+		dbcur = connection.cursor()
+		_ensure_watched_tables(dbcur)
+		connection.execute('BEGIN IMMEDIATE')
+		_check_cursor(dbcur, 'watched_cursor', old_cursor)
+		changed = 0
+		for operation, value in operations:
+			if operation == 'upsert_movie':
+				row = _watched_movie_row(dbcur, value)
+				before = dbcur.execute('SELECT * FROM floppy_watched_movies WHERE tmdb=?', (row[1],)).fetchone()
+				if before != row:
+					dbcur.execute('INSERT OR REPLACE INTO floppy_watched_movies VALUES (?, ?, ?, ?, ?)', row); changed += 1
+			elif operation == 'delete_movie':
+				dbcur.execute('DELETE FROM floppy_watched_movies WHERE tmdb=?', (str(value),)); changed += dbcur.rowcount
+			elif operation == 'upsert_episode':
+				row = _watched_episode_row(dbcur, value)
+				before = dbcur.execute('SELECT * FROM floppy_watched_episodes WHERE show_tmdb=? AND season=? AND episode=?', (row[1], row[3], row[4])).fetchone()
+				if before != row:
+					dbcur.execute('INSERT OR REPLACE INTO floppy_watched_episodes VALUES (?, ?, ?, ?, ?, ?)', row); changed += 1
+			elif operation == 'delete_episode':
+				tmdb, season, episode = value
+				dbcur.execute('DELETE FROM floppy_watched_episodes WHERE show_tmdb=? AND season=? AND episode=?', (str(tmdb), int(season), int(episode))); changed += dbcur.rowcount
+			else: raise ValueError('Unknown watched operation: %s' % operation)
+		if changed:
+			_bump_revision(dbcur, 'history')
+			dbcur.execute('INSERT OR REPLACE INTO service VALUES (?, ?)', ('last_history_at', datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')))
+		_write_sync_state(dbcur, 'watched_cursor', new_cursor)
+		connection.commit()
+		return changed
+	except:
+		connection.rollback()
+		raise
+	finally:
+		connection.close()
 
 
 def acquire_sync_lock():
@@ -656,18 +772,20 @@ def store_status_lists(snapshots):
 		connection.close()
 
 
-def store_bookmarks(rows, expected_revision):
+def store_bookmarks(rows, expected_revision, cursor=None, expected_cursor=None):
 	connection = get_connection()
 	try:
-		cursor = connection.cursor()
-		_ensure_bookmarks_table(cursor)
+		dbcur = connection.cursor()
+		_ensure_bookmarks_table(dbcur)
 		connection.execute('BEGIN IMMEDIATE')
-		if _read_revision(cursor, 'bookmarks') != expected_revision:
+		if _read_revision(dbcur, 'bookmarks') != expected_revision:
 			connection.rollback()
 			return False
-		_reconcile_rows(cursor, 'bookmarks', rows, (3, 4, 5, 6, 7))
-		_bump_revision(cursor, 'bookmarks')
-		cursor.execute('INSERT OR REPLACE INTO service VALUES (?, ?)', ('last_paused_at', datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')))
+		if cursor is not None and expected_cursor is not None: _check_cursor(dbcur, 'progress_cursor', expected_cursor)
+		_reconcile_rows(dbcur, 'bookmarks', rows, (3, 4, 5, 6, 7))
+		_bump_revision(dbcur, 'bookmarks')
+		dbcur.execute('INSERT OR REPLACE INTO service VALUES (?, ?)', ('last_paused_at', datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')))
+		if cursor is not None: _write_sync_state(dbcur, 'progress_cursor', int(cursor))
 		connection.commit()
 		return True
 	except Exception:
@@ -675,5 +793,53 @@ def store_bookmarks(rows, expected_revision):
 		from resources.lib.modules import log_utils
 		log_utils.error()
 		return False
+	finally:
+		connection.close()
+
+
+def _bookmark_key(row):
+	if len(row) != 14: raise ValueError('Invalid bookmark row')
+	tmdb, season, episode = str(row[4] or ''), str(row[6] or ''), str(row[7] or '')
+	if not tmdb: raise ValueError('Missing progress TMDB id')
+	if bool(season) != bool(episode): raise ValueError('Incomplete episode identity')
+	if season: int(season); int(episode)
+	return (tmdb, season, episode)
+
+
+def apply_progress_changes(operations, old_cursor, new_cursor):
+	old_cursor, new_cursor = int(old_cursor), int(new_cursor)
+	if new_cursor < old_cursor: raise ValueError('Cursor cannot move backwards')
+	connection = get_connection()
+	try:
+		dbcur = connection.cursor()
+		_ensure_bookmarks_table(dbcur)
+		connection.execute('BEGIN IMMEDIATE')
+		_check_cursor(dbcur, 'progress_cursor', old_cursor)
+		changed = 0
+		for operation, value in operations:
+			if operation == 'upsert':
+				row = list(str(item or '') for item in value)
+				tmdb, season, episode = _bookmark_key(row)
+				before = dbcur.execute('SELECT * FROM bookmarks WHERE tmdb=? AND season=? AND episode=?', (tmdb, season, episode)).fetchone()
+				if before:
+					for index in (0, 1, 2, 3, 5, 8, 9, 10, 13):
+						if not row[index]: row[index] = before[index]
+				row = tuple(row)
+				if before != row:
+					dbcur.execute('DELETE FROM bookmarks WHERE tmdb=? AND season=? AND episode=?', (tmdb, season, episode))
+					dbcur.execute('INSERT OR REPLACE INTO bookmarks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', row); changed += 1
+			elif operation == 'delete':
+				tmdb, season, episode = value
+				dbcur.execute('DELETE FROM bookmarks WHERE tmdb=? AND season=? AND episode=?', (str(tmdb), str(season), str(episode))); changed += dbcur.rowcount
+			else: raise ValueError('Unknown progress operation: %s' % operation)
+		if changed:
+			_bump_revision(dbcur, 'bookmarks')
+			dbcur.execute('INSERT OR REPLACE INTO service VALUES (?, ?)', ('last_paused_at', datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')))
+		_write_sync_state(dbcur, 'progress_cursor', new_cursor)
+		connection.commit()
+		return changed
+	except:
+		connection.rollback()
+		raise
 	finally:
 		connection.close()

@@ -415,8 +415,8 @@ def services_syncs():
 				log_utils.log('Floppy Service Sync is running.', 1)
 				if not control.monitor.abortRequested():
 					if getSetting('bookmarks') == 'true' and getSetting('scrobble.source') == '5':
-						floppy.sync_playbackProgress()
-					floppy.sync_watchedProgress(forced=True)
+						floppy.sync_playbackProgress(forced=(last_floppy_sync == 0))
+					floppy.sync_watchedProgress(forced=(last_floppy_sync == 0))
 				if not control.monitor.abortRequested():
 					floppy.sync_watch_list(forced=True)
 					floppy.sync_collection(forced=True)
